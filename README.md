@@ -103,7 +103,7 @@ websocat --version
 Test connection:
 
 ```bash
-websocat "wss://jetstream.bsky.network/subscribe?wantedCollections=app.bsky.feed.post" > output.json
+websocat "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post" > output.json
 ```
 
 More on Jetstream: [https://docs.bsky.app/blog/jetstream](https://docs.bsky.app/blog/jetstream)
