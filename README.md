@@ -64,7 +64,7 @@ This guide walks you through setting up a self-hosted Bluesky PDS that ingests d
    - Database: `pds_db`
    - User: `pds_user`
    - Password: `<your-password>`
-
+5. In Connections, add the VM from earlier with its external IP address to Authorized Networks.
 ---
 
 ### Test Connection from VM
@@ -89,13 +89,6 @@ pds_db=>
 ```
 
 Type `\q` to quit.
-
-```
-
----
-
-Do you want me to also **update the `.env` example** in your guide to include the new `pds_user` and `pds_db` placeholders so it’s consistent?
-```
 
 ## 5. SSH into VM and Install Websocat
 
