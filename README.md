@@ -44,7 +44,7 @@ This guide walks you through setting up a self-hosted Bluesky PDS that ingests d
 - Configuration:
   - Storage: 10GB SSD
   - vCPU: 1
-  - Memory: 3.75 GB
+  - Memory: 1.7 GB
   - Enable Public IP
 - Add your VM’s external IP to **Authorized Networks**
 
@@ -123,7 +123,7 @@ Follow official guide:
 ```bash
 sudo apt update
 sudo apt install -y python3-pip
-pip install --break-system-packages websockets asyncio asyncpg python-dotenv fastapi uvicorn sentence-transformers
+pip install --break-system-packages websockets aiohttp asyncio asyncpg python-dotenv fastapi uvicorn sentence-transformers
 ```
 
 Create your `.env` file:
@@ -227,39 +227,42 @@ import asyncio
 import websockets
 import json
 import asyncpg
+import aiohttp
 import os
 from datetime import datetime
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 import logging
 
-# Configure logging
+# ----------------------------------------------------------
+# Logging setup
+# ----------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file
+# ----------------------------------------------------------
+# Environment setup
+# ----------------------------------------------------------
 load_dotenv()
 
-# Database configuration from environment variables
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = int(os.getenv("DB_PORT", 5432))
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-# Load MiniLM v6 model (384-d)
+# Load embedding model
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Bluesky firehose WebSocket endpoint
-FIREHOSE_URL = (
-    "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post"
-)
+FIREHOSE_URL = "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post"
 
-# SQL to create the table
-CREATE_TABLE_SQL = """
+# ----------------------------------------------------------
+# SQL Definitions
+# ----------------------------------------------------------
+CREATE_POSTS_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS posts (
     id SERIAL PRIMARY KEY,
     repo TEXT,
@@ -272,14 +275,57 @@ CREATE TABLE IF NOT EXISTS posts (
 );
 """
 
-# SQL to insert a post
+CREATE_AUTHORS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS authors (
+    id TEXT PRIMARY KEY,
+    handle TEXT,
+    display_name TEXT,
+    description TEXT,
+    posts_text TEXT,
+    display_name_embedding VECTOR(384),
+    handle_embedding VECTOR(384),
+    description_embedding VECTOR(384),
+    posts_embedding VECTOR(384),
+    followers_count INTEGER DEFAULT 0,
+    follows_count INTEGER DEFAULT 0,
+    posts_count INTEGER DEFAULT 0,
+    updated_at TIMESTAMP
+);
+"""
+
 INSERT_POST_SQL = """
 INSERT INTO posts (repo, rkey, cid, text, created_at, embedding, raw)
 VALUES ($1, $2, $3, $4, $5, $6, $7);
 """
 
+UPSERT_AUTHOR_SQL = """
+INSERT INTO authors (
+    id, handle, display_name, description, posts_text,
+    display_name_embedding, handle_embedding, description_embedding, posts_embedding,
+    followers_count, follows_count, posts_count, updated_at
+)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+ON CONFLICT (id) DO UPDATE
+SET
+    handle = EXCLUDED.handle,
+    display_name = EXCLUDED.display_name,
+    description = EXCLUDED.description,
+    posts_text = LEFT(EXCLUDED.posts_text || authors.posts_text, 500),
+    display_name_embedding = EXCLUDED.display_name_embedding,
+    handle_embedding = EXCLUDED.handle_embedding,
+    description_embedding = EXCLUDED.description_embedding,
+    posts_embedding = EXCLUDED.posts_embedding,
+    followers_count = EXCLUDED.followers_count,
+    follows_count = EXCLUDED.follows_count,
+    posts_count = EXCLUDED.posts_count,
+    updated_at = GREATEST(EXCLUDED.updated_at, authors.updated_at);
+"""
+
+# ----------------------------------------------------------
+# Database initialization
+# ----------------------------------------------------------
 async def init_db():
-    """Connects to the database and ensures the posts table exists."""
+    """Connects to DB and ensures tables exist."""
     conn = await asyncpg.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -288,14 +334,56 @@ async def init_db():
         database=DB_NAME,
         ssl="require"
     )
-    # Enable the vector extension if not enabled already
     await conn.execute("CREATE EXTENSION IF NOT EXISTS vector;")
-    await conn.execute(CREATE_TABLE_SQL)
+    await conn.execute(CREATE_POSTS_TABLE_SQL)
+    await conn.execute(CREATE_AUTHORS_TABLE_SQL)
     await conn.close()
-    logger.info("Database initialized and table ensured.")
+    logger.info("Database initialized and tables ensured.")
 
+# ----------------------------------------------------------
+# Helper functions
+# ----------------------------------------------------------
+def extract_text(record):
+    """Extract post text + alt text from embedded images."""
+    text = record.get("text", "")
+    alt_texts = []
+    embed = record.get("embed", {})
+    if embed.get("$type", "").startswith("app.bsky.embed.images"):
+        for img in embed.get("images", []):
+            alt = img.get("alt")
+            if alt:
+                alt_texts.append(alt)
+    combined_text = text + " " + " ".join(alt_texts)
+    return combined_text.strip()
+
+
+async def fetch_profile(session, did):
+    """Fetch profile info for a DID from Bluesky API."""
+    url = f"https://public.api.bsky.app/xrpc/app.bsky.actor.getProfile?actor={did}"
+    try:
+        async with session.get(url, timeout=10) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return {
+                    "handle": data.get("handle"),
+                    "display_name": data.get("displayName", ""),
+                    "description": data.get("description", ""),
+                    "followers_count": data.get("followersCount", 0),
+                    "follows_count": data.get("followsCount", 0),
+                    "posts_count": data.get("postsCount", 0),
+                }
+            else:
+                logger.warning(f"Failed to fetch profile for {did}: {resp.status}")
+                return None
+    except Exception as e:
+        logger.error(f"Error fetching profile for {did}: {e}")
+        return None
+
+# ----------------------------------------------------------
+# Firehose processing loop
+# ----------------------------------------------------------
 async def handle_firehose():
-    """Connects to the Bluesky firehose and stores posts in the database."""
+    """Listen to firehose and store posts and authors."""
     db = await asyncpg.create_pool(
         host=DB_HOST,
         port=DB_PORT,
@@ -305,69 +393,102 @@ async def handle_firehose():
         ssl="require"
     )
 
-    while True:
-        try:
-            async with websockets.connect(
-                FIREHOSE_URL,
-                ping_interval=20,      # send ping every 20 seconds
-                ping_timeout=10        # wait 10 seconds for pong before considering connection lost
-            ) as ws:
-                logger.info("Connected to Bluesky firehose.")
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                async with websockets.connect(FIREHOSE_URL, ping_interval=20, ping_timeout=10) as ws:
+                    logger.info("Connected to Bluesky firehose.")
 
-                async for message in ws:
-                    logger.debug(f"Raw message: {message}")
-                    try:
-                        evt = json.loads(message)
-                        logger.debug(f"Event keys: {list(evt.keys())}")
+                    async for message in ws:
+                        try:
+                            evt = json.loads(message)
+                            commit = evt.get("commit", {})
+                            collection = commit.get("collection")
+                            operation = commit.get("operation")
 
-                        commit = evt.get("commit", {})
-                        collection = commit.get("collection")
-                        operation = commit.get("operation")
-                        logger.debug(f"Collection: {collection} | Operation: {operation}")
+                            if collection != "app.bsky.feed.post" or operation != "create":
+                                continue
 
-                        # Only handle creates for app.bsky.feed.post
-                        if collection != "app.bsky.feed.post" or operation != "create":
-                            continue
+                            repo = evt.get("did")
+                            rkey = commit.get("rkey")
+                            cid = commit.get("cid")
+                            record = commit.get("record", {})
+                            record_json = json.dumps(record)
 
-                        repo = evt.get("did")
-                        rkey = commit.get("rkey")
-                        cid = commit.get("cid")
-                        record = commit.get("record", {})
-                        record_json = json.dumps(record)
+                            # Combine text + alt texts
+                            combined_text = extract_text(record)
 
-                        text = record.get("text")
-                        created_at_str = record.get("createdAt")
+                            # Parse creation time
+                            created_at = None
+                            created_at_str = record.get("createdAt")
+                            if created_at_str:
+                                dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
+                                created_at = dt.replace(tzinfo=None)
 
-                        # Convert ISO string to naive datetime
-                        created_at = None
-                        if created_at_str:
-                            dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
-                            created_at = dt.replace(tzinfo=None)
+                            # Generate post embedding
+                            post_embedding = model.encode(combined_text).tolist()
+                            post_embedding_str = f"[{','.join(map(str, post_embedding))}]"
 
-                        # Generate raw embedding
-                        raw_embedding = model.encode(text).tolist()
+                            # Insert post
+                            await db.execute(
+                                INSERT_POST_SQL,
+                                repo, rkey, cid, combined_text, created_at, post_embedding_str, record_json
+                            )
+                            logger.info(f"Inserted post from {repo}")
 
-                        # Convert raw embedding list to pgvector string format
-                        embedding = f"[{','.join(map(str, raw_embedding))}]"
+                            # Check if author exists
+                            existing_author = await db.fetchrow("SELECT id FROM authors WHERE id = $1", repo)
+                            if not existing_author:
+                                profile = await fetch_profile(session, repo) or {}
+                                handle = profile.get("handle", repo)
+                                display_name = profile.get("display_name", "")
+                                description = profile.get("description", "")
+                                followers_count = profile.get("followers_count", 0)
+                                follows_count = profile.get("follows_count", 0)
+                                posts_count = profile.get("posts_count", 0)
 
-                        await db.execute(
-                            INSERT_POST_SQL,
-                            repo, rkey, cid, text, created_at, embedding, record_json
-                        )
+                                posts_text = combined_text[:500]
+                                updated_at = created_at
 
-                        logger.info(f"Inserted post from {repo}")
+                                # Embeddings
+                                display_name_emb = f"[{','.join(map(str, model.encode(display_name).tolist()))}]"
+                                handle_emb = f"[{','.join(map(str, model.encode(handle).tolist()))}]"
+                                desc_emb = f"[{','.join(map(str, model.encode(description).tolist()))}]"
+                                posts_emb = f"[{','.join(map(str, model.encode(posts_text).tolist()))}]"
 
-                    except Exception as e:
-                        logger.error(f"Error processing message: {e}", exc_info=True)
+                                await db.execute(
+                                    UPSERT_AUTHOR_SQL,
+                                    repo, handle, display_name, description, posts_text,
+                                    display_name_emb, handle_emb, desc_emb, posts_emb,
+                                    followers_count, follows_count, posts_count, updated_at
+                                )
+                                logger.info(f"Inserted new author {repo} ({handle}) with {followers_count} followers")
+                            else:
+                                # Update existing author’s recent posts
+                                posts_text = combined_text[:500]
+                                posts_emb = f"[{','.join(map(str, model.encode(posts_text).tolist()))}]"
+                                await db.execute("""
+                                    UPDATE authors
+                                    SET posts_text = LEFT($1 || posts_text, 500),
+                                        posts_embedding = $2,
+                                        updated_at = GREATEST($3, updated_at)
+                                    WHERE id = $4
+                                """, posts_text, posts_emb, created_at, repo)
+                                logger.info(f"Updated author {repo}")
 
-        except websockets.ConnectionClosedError as e:
-            logger.warning(f"WebSocket connection closed with error: {e}. Reconnecting in 5 seconds...")
-            await asyncio.sleep(5)  # wait before reconnecting
-        except Exception as e:
-            logger.error(f"Unexpected error in WebSocket connection: {e}", exc_info=True)
-            logger.info("Reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
+                        except Exception as e:
+                            logger.error(f"Error processing message: {e}", exc_info=True)
 
+            except websockets.ConnectionClosedError as e:
+                logger.warning(f"WebSocket closed: {e}. Reconnecting in 5s...")
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}", exc_info=True)
+                await asyncio.sleep(5)
+
+# ----------------------------------------------------------
+# Entrypoint
+# ----------------------------------------------------------
 async def main():
     await init_db()
     await handle_firehose()
@@ -470,7 +591,6 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-# Assemble the database URL
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 @asynccontextmanager
@@ -483,28 +603,150 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# Add CORS middleware
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Or specify allowed origins instead of ["*"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-@app.get("/search")
+# --- TEXT SEARCH ENDPOINTS ---
+
+@app.get("/search/posts")
 async def search_posts(q: str = Query(...)):
-    logger.info(f"Received search query: {q}")
+    """
+    Search for posts by text (ILIKE).
+    """
+    logger.info(f"Received post search query: {q}")
     async with app.state.pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT * FROM posts WHERE text ILIKE $1 ORDER BY created_at DESC LIMIT 50", f"%{q}%"
+            """
+            SELECT * FROM posts
+            WHERE text ILIKE $1
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            f"%{q}%",
         )
-        logger.info(f"Returned {len(rows)} results")
-        return [dict(row) for row in rows]
+    return [dict(row) for row in rows]
+
+
+@app.get("/search/authors")
+async def search_authors(q: str = Query(...), use_embedding: bool = Query(False)):
+    """
+    Search for authors by display_name, handle, description, or posts_text.
+    Ranking is primarily by fame (followers_count + posts_count).
+    Optional: use_embedding=True will rank by embedding similarity first.
+    """
+    logger.info(f"Received author search query: {q} (use_embedding={use_embedding})")
+    async with app.state.pool.acquire() as conn:
+        if use_embedding:
+            # Use embedding similarity if requested
+            rows = await conn.fetch(
+                """
+                SELECT *,
+                       1 - (posts_embedding <=> $1) AS similarity,
+                       (followers_count + posts_count) AS fame_score
+                FROM authors
+                WHERE posts_embedding IS NOT NULL
+                ORDER BY similarity DESC, fame_score DESC, updated_at DESC
+                LIMIT 50
+                """,
+                f"[{','.join(map(str, q))}]" if isinstance(q, list) else f"%{q}%",
+            )
+        else:
+            # Text-based search
+            rows = await conn.fetch(
+                """
+                SELECT *,
+                       (followers_count + posts_count) AS fame_score
+                FROM authors
+                WHERE
+                    display_name ILIKE $1
+                    OR handle ILIKE $1
+                    OR description ILIKE $1
+                    OR posts_text ILIKE $1
+                ORDER BY fame_score DESC, updated_at DESC
+                LIMIT 50
+                """,
+                f"%{q}%",
+            )
+    return [dict(row) for row in rows]
+
+# --- VECTOR SIMILARITY SEARCH ENDPOINTS ---
+
+@app.post("/vector/search/posts")
+async def vector_search_posts(vector: list[float]):
+    """
+    Find posts whose embeddings are most similar to the provided 384-dim vector.
+    """
+    if len(vector) != 384:
+        return {"error": "Vector must be 384-dimensional."}
+
+    vector_str = f"[{','.join(map(str, vector))}]"
+
+    async with app.state.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT *,
+                   1 - (embedding <=> $1) AS similarity
+            FROM posts
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> $1
+            LIMIT 25
+            """,
+            vector_str,
+        )
+
+    return [dict(row) for row in rows]
+
+
+@app.post("/vector/search/authors")
+async def vector_search_authors(vector: list[float]):
+    """
+    Find authors whose posts_embedding are most similar to the provided 384-dim vector.
+    """
+    if len(vector) != 384:
+        return {"error": "Vector must be 384-dimensional."}
+
+    vector_str = f"[{','.join(map(str, vector))}]"
+
+    async with app.state.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT *,
+                   1 - (posts_embedding <=> $1) AS similarity
+            FROM authors
+            WHERE posts_embedding IS NOT NULL
+            ORDER BY posts_embedding <=> $1
+            LIMIT 25
+            """,
+            vector_str,
+        )
+
+    return [dict(row) for row in rows]
+
+# --- ROOT ENDPOINT ---
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Cosine API online",
+        "endpoints": [
+            "/search/posts",
+            "/search/authors",
+            "/vector/search/posts",
+            "/vector/search/authors"
+        ]
+    }
+
 
 if __name__ == "__main__":
     logger.info("Starting API server...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 ```
 
 ---
